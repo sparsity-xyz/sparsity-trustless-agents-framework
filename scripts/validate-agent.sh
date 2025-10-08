@@ -1,17 +1,38 @@
 #!/bin/bash
 set -e
 
+# Color helpers
+RED="\033[0;31m"
+GREEN="\033[0;32m"
+YELLOW="\033[0;33m"
+BLUE="\033[0;34m"
+BOLD="\033[1m"
+RESET="\033[0m"
+
+info() { printf "%b%s%b\n" "${BLUE}" "[INFO] $*" "${RESET}"; }
+step() { printf "%b%s%b\n" "${BOLD}${BLUE}" "==> $*" "${RESET}"; }
+success() { printf "%b%s%b\n" "${GREEN}" "[OK] $*" "${RESET}"; }
+warn() { printf "%b%s%b\n" "${YELLOW}" "[WARN] $*" "${RESET}"; }
+err() { printf "%b%s%b\n" "${RED}" "[ERROR] $*" "${RESET}" 1>&2; }
+
+trap 'err "Script failed at line $LINENO."; exit 1' ERR
+
 # Load environment variables
 if [ ! -f .env ]; then
-    echo "Error: .env file not found"
+    err " .env file not found"
     exit 1
 fi
 source .env
 
+step "Loaded .env file"
+
 # Check required variables
+step "Checking required environment variables"
 if [ -z "$REGISTRY" ] || [ -z "$RPC_URL" ] || [ -z "$PRIVATE_KEY" ]; then
-    echo "Error: REGISTRY, RPC_URL, and PRIVATE_KEY must be set in .env"
+    err "REGISTRY, RPC_URL, and PRIVATE_KEY must be set in .env"
     exit 1
+else
+    success "Required environment variables present"
 fi
 
 # Default parameters (can be overridden by environment or CLI)
@@ -50,63 +71,76 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "=== Validating Agent with TEEValidationRegistry ==="
-echo "Registry: $REGISTRY"
-echo "URL: $AGENT_URL"
-echo "TEE Arch: $TEE_ARCH"
-echo "Proof path: $PROOF_PATH"
+step "Starting validation against TEEValidationRegistry"
+info "Registry: $REGISTRY"
+info "Agent URL: $AGENT_URL"
+info "TEE Arch: $TEE_ARCH"
+info "Proof path: $PROOF_PATH"
 echo
 
 # Ensure proof file exists
+step "Checking proof file exists"
 if [ ! -f "$PROOF_PATH" ]; then
-    echo "Error: proof file not found at '$PROOF_PATH'"
+    err "Proof file not found at '$PROOF_PATH'"
     exit 1
+else
+    success "Found proof file: $PROOF_PATH"
 fi
 
-# Parse proof JSON
+step "Parsing proof JSON"
 JOURNAL=$(jq -r '.raw_proof.journal' "$PROOF_PATH")
 ONCHAIN_PROOF=$(jq -r '.onchain_proof' "$PROOF_PATH")
 PROOF_TYPE=$(jq -r '.proof_type' "$PROOF_PATH")
 ZK_TYPE=$(jq -r '.zktype' "$PROOF_PATH")
+success "Parsed proof JSON"
 
 # Verify proof type
+step "Verifying proof type"
 if [ "$PROOF_TYPE" != "Verifier" ]; then
-    echo "Error: Expected proof_type 'Verifier', got: $PROOF_TYPE"
+    err "Expected proof_type 'Verifier', got: $PROOF_TYPE"
     exit 1
+else
+    success "Proof type is 'Verifier'"
 fi
 
 # Convert zktype to enum value (0 = Risc0, 1 = SP1)
+# Convert zktype to enum value (1 = Risc0, 2 = Succinct)
+step "Converting zktype to enum"
 if [ "$ZK_TYPE" = "Risc0" ]; then
     ZK_TYPE_ENUM=1
+    success "ZK type: Risc0 -> enum $ZK_TYPE_ENUM"
 elif [ "$ZK_TYPE" = "Succinct" ]; then
     ZK_TYPE_ENUM=2
+    success "ZK type: Succinct -> enum $ZK_TYPE_ENUM"
 else
-    echo "Error: Unknown zktype: $ZK_TYPE"
+    err "Unknown zktype: $ZK_TYPE"
     exit 1
 fi
 
 # Convert TEE arch to bytes32
 TEE_ARCH_BYTES32=$(echo -n "$TEE_ARCH" | xxd -p | tr -d '\n' | awk '{printf "0x%-64s\n", $0}' | sed 's/ /0/g')
 
-echo "Converted values:"
-echo "  TEE Arch (bytes32): $TEE_ARCH_BYTES32"
-echo "  ZK Type (enum): $ZK_TYPE_ENUM ($ZK_TYPE)"
+step "Converted values"
+info "TEE Arch (bytes32): $TEE_ARCH_BYTES32"
+info "ZK Type (enum): $ZK_TYPE_ENUM ($ZK_TYPE)"
 echo
 
 # First check if zkVerifier is set
-echo "Checking zkVerifier..."
+step "Checking zkVerifier in registry"
 ZK_VERIFIER=$(cast call "$REGISTRY" "zkVerifier()(address)" --rpc-url "$RPC_URL")
-echo "zkVerifier: $ZK_VERIFIER"
+info "zkVerifier: $ZK_VERIFIER"
 
 if [ "$ZK_VERIFIER" = "0x0000000000000000000000000000000000000000" ]; then
-    echo "Error: zkVerifier is not set in registry"
+    err "zkVerifier is not set in registry"
     exit 1
+else
+    success "zkVerifier present: $ZK_VERIFIER"
 fi
 
 echo
 
 # Call validateAgent with correct parameter order from interface
-echo "Calling validateAgent..."
+step "Calling validateAgent on registry (sending transaction)"
 RESULT=$(cast send "$REGISTRY" \
     "validateAgent(string,bytes32,uint8,bytes,bytes)" \
     "$AGENT_URL" \
@@ -119,7 +153,9 @@ RESULT=$(cast send "$REGISTRY" \
     --gas-limit 3000000 \
     --json)
 
+info "Transaction result (raw):"
 echo "$RESULT"
+success "Transaction submitted"
 
 # Extract agent ID from event logs (second topic in the AgentValidated event)
 AGENT_ID=$(echo "$RESULT" | jq -r '.logs[0].topics[1]' 2>/dev/null)
@@ -128,11 +164,11 @@ if [ -n "$AGENT_ID" ] && [ "$AGENT_ID" != "null" ]; then
     # Convert hex to decimal
     AGENT_ID_DEC=$((AGENT_ID))
     echo
-    echo "=== Agent validated successfully! ==="
-    echo "Agent ID: $AGENT_ID_DEC (hex: $AGENT_ID)"
+    success "Agent validated successfully!"
+    info "Agent ID: $AGENT_ID_DEC (hex: $AGENT_ID)"
 else
     echo
-    echo "=== Agent validated successfully! ==="
-    echo "Warning: Could not extract agent ID from transaction"
+    success "Agent validated successfully!"
+    warn "Could not extract agent ID from transaction"
 fi
 
